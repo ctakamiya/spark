@@ -17,18 +17,20 @@
 
 package org.apache.spark.deploy.worker.ui
 
+import java.io.File
 import javax.servlet.http.HttpServletRequest
 
 import scala.xml.Node
 
-import org.apache.spark.ui.{WebUIPage, UIUtils}
+import org.apache.spark.internal.Logging
+import org.apache.spark.ui.{UIUtils, WebUIPage}
 import org.apache.spark.util.Utils
-import org.apache.spark.Logging
 import org.apache.spark.util.logging.RollingFileAppender
 
-private[spark] class LogPage(parent: WorkerWebUI) extends WebUIPage("logPage") with Logging {
+private[ui] class LogPage(parent: WorkerWebUI) extends WebUIPage("logPage") with Logging {
   private val worker = parent.worker
-  private val workDir = parent.workDir
+  private val workDir = new File(parent.workDir.toURI.normalize().getPath)
+  private val supportedLogTypes = Set("stderr", "stdout")
 
   def renderLog(request: HttpServletRequest): String = {
     val defaultBytes = 100 * 1024
@@ -105,20 +107,18 @@ private[spark] class LogPage(parent: WorkerWebUI) extends WebUIPage("logPage") w
       }
 
     val content =
-      <html>
-        <body>
-          {linkToMaster}
-          <div>
-            <div style="float:left; margin-right:10px">{backButton}</div>
-            <div style="float:left;">{range}</div>
-            <div style="float:right; margin-left:10px">{nextButton}</div>
-          </div>
-          <br />
-          <div style="height:500px; overflow:auto; padding:5px;">
-            <pre>{logText}</pre>
-          </div>
-        </body>
-      </html>
+      <div>
+        {linkToMaster}
+        <div>
+          <div style="float:left; margin-right:10px">{backButton}</div>
+          <div style="float:left;">{range}</div>
+          <div style="float:right; margin-left:10px">{nextButton}</div>
+        </div>
+        <br />
+        <div style="height:500px; overflow:auto; padding:5px;">
+          <pre>{logText}</pre>
+        </div>
+      </div>
     UIUtils.basicSparkPage(content, logType + " log page for " + pageName)
   }
 
@@ -129,6 +129,18 @@ private[spark] class LogPage(parent: WorkerWebUI) extends WebUIPage("logPage") w
       offsetOption: Option[Long],
       byteLength: Int
     ): (String, Long, Long, Long) = {
+
+    if (!supportedLogTypes.contains(logType)) {
+      return ("Error: Log type must be one of " + supportedLogTypes.mkString(", "), 0, 0, 0)
+    }
+
+    // Verify that the normalized path of the log directory is in the working directory
+    val normalizedUri = new File(logDirectory).toURI.normalize()
+    val normalizedLogDir = new File(normalizedUri.getPath)
+    if (!Utils.isInDirectory(workDir, normalizedLogDir)) {
+      return ("Error: invalid log directory " + logDirectory, 0, 0, 0)
+    }
+
     try {
       val files = RollingFileAppender.getSortedRolledOverFiles(logDirectory, logType)
       logDebug(s"Sorted log files of type $logType in $logDirectory:\n${files.mkString("\n")}")
@@ -144,7 +156,7 @@ private[spark] class LogPage(parent: WorkerWebUI) extends WebUIPage("logPage") w
           offset
         }
       }
-      val endIndex = math.min(startIndex + totalLength, totalLength)
+      val endIndex = math.min(startIndex + byteLength, totalLength)
       logDebug(s"Getting log from $startIndex to $endIndex")
       val logText = Utils.offsetBytes(files, startIndex, endIndex)
       logDebug(s"Got log of length ${logText.length} bytes")

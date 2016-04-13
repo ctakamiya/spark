@@ -22,16 +22,16 @@ import java.util.Properties
 import scala.collection.Map
 import scala.reflect.{classTag, ClassTag}
 
-import kafka.consumer.{KafkaStream, Consumer, ConsumerConfig, ConsumerConnector}
+import kafka.consumer.{Consumer, ConsumerConfig, ConsumerConnector, KafkaStream}
 import kafka.serializer.Decoder
 import kafka.utils.VerifiableProperties
 
-import org.apache.spark.Logging
+import org.apache.spark.internal.Logging
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.streaming.StreamingContext
 import org.apache.spark.streaming.dstream._
 import org.apache.spark.streaming.receiver.Receiver
-import org.apache.spark.util.Utils
+import org.apache.spark.util.ThreadUtils
 
 /**
  * Input stream that pulls messages from a Kafka Broker.
@@ -48,12 +48,12 @@ class KafkaInputDStream[
   V: ClassTag,
   U <: Decoder[_]: ClassTag,
   T <: Decoder[_]: ClassTag](
-    @transient ssc_ : StreamingContext,
+    _ssc: StreamingContext,
     kafkaParams: Map[String, String],
     topics: Map[String, Int],
     useReliableReceiver: Boolean,
     storageLevel: StorageLevel
-  ) extends ReceiverInputDStream[(K, V)](ssc_) with Logging {
+  ) extends ReceiverInputDStream[(K, V)](_ssc) with Logging {
 
   def getReceiver(): Receiver[(K, V)] = {
     if (!useReliableReceiver) {
@@ -111,7 +111,8 @@ class KafkaReceiver[
     val topicMessageStreams = consumerConnector.createMessageStreams(
       topics, keyDecoder, valueDecoder)
 
-    val executorPool = Utils.newDaemonFixedThreadPool(topics.values.sum, "KafkaMessageHandler")
+    val executorPool =
+      ThreadUtils.newDaemonFixedThreadPool(topics.values.sum, "KafkaMessageHandler")
     try {
       // Start the messages handler for each partition
       topicMessageStreams.values.foreach { streams =>
@@ -134,7 +135,7 @@ class KafkaReceiver[
           store((msgAndMetadata.key, msgAndMetadata.message))
         }
       } catch {
-        case e: Throwable => logError("Error handling message; exiting", e)
+        case e: Throwable => reportError("Error handling message; exiting", e)
       }
     }
   }

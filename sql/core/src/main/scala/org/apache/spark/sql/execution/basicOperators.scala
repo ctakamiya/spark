@@ -17,252 +17,502 @@
 
 package org.apache.spark.sql.execution
 
-import org.apache.spark.{SparkEnv, HashPartitioner, SparkConf}
-import org.apache.spark.annotation.DeveloperApi
-import org.apache.spark.rdd.{RDD, ShuffledRDD}
-import org.apache.spark.shuffle.sort.SortShuffleManager
-import org.apache.spark.sql.catalyst.ScalaReflection
-import org.apache.spark.sql.catalyst.errors._
+import org.apache.spark.rdd.{PartitionwiseSampledRDD, RDD}
+import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.plans.physical.{ClusteredDistribution, OrderedDistribution, SinglePartition, UnspecifiedDistribution}
-import org.apache.spark.util.MutablePair
-import org.apache.spark.util.collection.ExternalSorter
+import org.apache.spark.sql.catalyst.expressions.codegen.{CodegenContext, ExprCode, ExpressionCanonicalizer, GenerateUnsafeProjection}
+import org.apache.spark.sql.catalyst.plans.physical._
+import org.apache.spark.sql.execution.metric.SQLMetrics
+import org.apache.spark.sql.types.LongType
+import org.apache.spark.util.random.{BernoulliCellSampler, PoissonSampler}
 
-/**
- * :: DeveloperApi ::
- */
-@DeveloperApi
-case class Project(projectList: Seq[NamedExpression], child: SparkPlan) extends UnaryNode {
-  override def output = projectList.map(_.toAttribute)
+case class Project(projectList: Seq[NamedExpression], child: SparkPlan)
+  extends UnaryNode with CodegenSupport {
 
-  @transient lazy val buildProjection = newMutableProjection(projectList, child.output)
+  override def output: Seq[Attribute] = projectList.map(_.toAttribute)
 
-  override def execute() = child.execute().mapPartitions { iter =>
-    val resuableProjection = buildProjection()
-    iter.map(resuableProjection)
+  override def upstreams(): Seq[RDD[InternalRow]] = {
+    child.asInstanceOf[CodegenSupport].upstreams()
   }
-}
 
-/**
- * :: DeveloperApi ::
- */
-@DeveloperApi
-case class Filter(condition: Expression, child: SparkPlan) extends UnaryNode {
-  override def output = child.output
-
-  @transient lazy val conditionEvaluator = newPredicate(condition, child.output)
-
-  override def execute() = child.execute().mapPartitions { iter =>
-    iter.filter(conditionEvaluator)
+  protected override def doProduce(ctx: CodegenContext): String = {
+    child.asInstanceOf[CodegenSupport].produce(ctx, this)
   }
+
+  override def usedInputs: AttributeSet = {
+    // only the attributes those are used at least twice should be evaluated before this plan,
+    // otherwise we could defer the evaluation until output attribute is actually used.
+    val usedExprIds = projectList.flatMap(_.collect {
+      case a: Attribute => a.exprId
+    })
+    val usedMoreThanOnce = usedExprIds.groupBy(id => id).filter(_._2.size > 1).keySet
+    references.filter(a => usedMoreThanOnce.contains(a.exprId))
+  }
+
+  override def doConsume(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String = {
+    val exprs = projectList.map(x =>
+      ExpressionCanonicalizer.execute(BindReferences.bindReference(x, child.output)))
+    ctx.currentVars = input
+    val resultVars = exprs.map(_.gen(ctx))
+    // Evaluation of non-deterministic expressions can't be deferred.
+    val nonDeterministicAttrs = projectList.filterNot(_.deterministic).map(_.toAttribute)
+    s"""
+       |${evaluateRequiredVariables(output, resultVars, AttributeSet(nonDeterministicAttrs))}
+       |${consume(ctx, resultVars)}
+     """.stripMargin
+  }
+
+  protected override def doExecute(): RDD[InternalRow] = {
+    child.execute().mapPartitionsInternal { iter =>
+      val project = UnsafeProjection.create(projectList, child.output,
+        subexpressionEliminationEnabled)
+      iter.map(project)
+    }
+  }
+
+  override def outputOrdering: Seq[SortOrder] = child.outputOrdering
 }
 
-/**
- * :: DeveloperApi ::
- */
-@DeveloperApi
-case class Sample(fraction: Double, withReplacement: Boolean, seed: Long, child: SparkPlan)
-  extends UnaryNode
-{
-  override def output = child.output
 
-  // TODO: How to pick seed?
-  override def execute() = child.execute().map(_.copy()).sample(withReplacement, fraction, seed)
-}
+case class Filter(condition: Expression, child: SparkPlan)
+  extends UnaryNode with CodegenSupport with PredicateHelper {
 
-/**
- * :: DeveloperApi ::
- */
-@DeveloperApi
-case class Union(children: Seq[SparkPlan]) extends SparkPlan {
-  // TODO: attributes output by union should be distinct for nullability purposes
-  override def output = children.head.output
-  override def execute() = sparkContext.union(children.map(_.execute()))
-}
+  // Split out all the IsNotNulls from condition.
+  private val (notNullPreds, otherPreds) = splitConjunctivePredicates(condition).partition {
+    case IsNotNull(a: NullIntolerant) if a.references.subsetOf(child.outputSet) => true
+    case _ => false
+  }
 
-/**
- * :: DeveloperApi ::
- * Take the first limit elements. Note that the implementation is different depending on whether
- * this is a terminal operator or not. If it is terminal and is invoked using executeCollect,
- * this operator uses something similar to Spark's take method on the Spark driver. If it is not
- * terminal or is invoked using execute, we first take the limit on each partition, and then
- * repartition all the data to a single partition to compute the global limit.
- */
-@DeveloperApi
-case class Limit(limit: Int, child: SparkPlan)
-  extends UnaryNode {
-  // TODO: Implement a partition local limit, and use a strategy to generate the proper limit plan:
-  // partition local limit -> exchange into one partition -> partition local limit again
+  // The columns that will filtered out by `IsNotNull` could be considered as not nullable.
+  private val notNullAttributes = notNullPreds.flatMap(_.references).distinct.map(_.exprId)
 
-  /** We must copy rows when sort based shuffle is on */
-  private def sortBasedShuffleOn = SparkEnv.get.shuffleManager.isInstanceOf[SortShuffleManager]
+  // Mark this as empty. We'll evaluate the input during doConsume(). We don't want to evaluate
+  // all the variables at the beginning to take advantage of short circuiting.
+  override def usedInputs: AttributeSet = AttributeSet.empty
 
-  override def output = child.output
-  override def outputPartitioning = SinglePartition
-
-  override def executeCollect(): Array[Row] = child.executeTake(limit)
-
-  override def execute() = {
-    val rdd: RDD[_ <: Product2[Boolean, Row]] = if (sortBasedShuffleOn) {
-      child.execute().mapPartitions { iter =>
-        iter.take(limit).map(row => (false, row.copy()))
-      }
-    } else {
-      child.execute().mapPartitions { iter =>
-        val mutablePair = new MutablePair[Boolean, Row]()
-        iter.take(limit).map(row => mutablePair.update(false, row))
+  override def output: Seq[Attribute] = {
+    child.output.map { a =>
+      if (a.nullable && notNullAttributes.contains(a.exprId)) {
+        a.withNullability(false)
+      } else {
+        a
       }
     }
-    val part = new HashPartitioner(1)
-    val shuffled = new ShuffledRDD[Boolean, Row, Row](rdd, part)
-    shuffled.setSerializer(new SparkSqlSerializer(new SparkConf(false)))
-    shuffled.mapPartitions(_.take(limit).map(_._2))
-  }
-}
-
-/**
- * :: DeveloperApi ::
- * Take the first limit elements as defined by the sortOrder. This is logically equivalent to
- * having a [[Limit]] operator after a [[Sort]] operator. This could have been named TopK, but
- * Spark's top operator does the opposite in ordering so we name it TakeOrdered to avoid confusion.
- */
-@DeveloperApi
-case class TakeOrdered(limit: Int, sortOrder: Seq[SortOrder], child: SparkPlan) extends UnaryNode {
-
-  override def output = child.output
-  override def outputPartitioning = SinglePartition
-
-  val ord = new RowOrdering(sortOrder, child.output)
-
-  // TODO: Is this copying for no reason?
-  override def executeCollect() = child.execute().map(_.copy()).takeOrdered(limit)(ord)
-    .map(ScalaReflection.convertRowToScala(_, this.schema))
-
-  // TODO: Terminal split should be implemented differently from non-terminal split.
-  // TODO: Pick num splits based on |limit|.
-  override def execute() = sparkContext.makeRDD(executeCollect(), 1)
-}
-
-/**
- * :: DeveloperApi ::
- * Performs a sort on-heap.
- * @param global when true performs a global sort of all partitions by shuffling the data first
- *               if necessary.
- */
-@DeveloperApi
-case class Sort(
-    sortOrder: Seq[SortOrder],
-    global: Boolean,
-    child: SparkPlan)
-  extends UnaryNode {
-  override def requiredChildDistribution =
-    if (global) OrderedDistribution(sortOrder) :: Nil else UnspecifiedDistribution :: Nil
-
-  override def execute() = attachTree(this, "sort") {
-    child.execute().mapPartitions( { iterator =>
-      val ordering = newOrdering(sortOrder, child.output)
-      iterator.map(_.copy()).toArray.sorted(ordering).iterator
-    }, preservesPartitioning = true)
   }
 
-  override def output = child.output
-}
+  private[sql] override lazy val metrics = Map(
+    "numOutputRows" -> SQLMetrics.createLongMetric(sparkContext, "number of output rows"))
 
-/**
- * :: DeveloperApi ::
- * Performs a sort, spilling to disk as needed.
- * @param global when true performs a global sort of all partitions by shuffling the data first
- *               if necessary.
- */
-@DeveloperApi
-case class ExternalSort(
-    sortOrder: Seq[SortOrder],
-    global: Boolean,
-    child: SparkPlan)
-  extends UnaryNode {
-  override def requiredChildDistribution =
-    if (global) OrderedDistribution(sortOrder) :: Nil else UnspecifiedDistribution :: Nil
-
-  override def execute() = attachTree(this, "sort") {
-    child.execute().mapPartitions( { iterator =>
-      val ordering = newOrdering(sortOrder, child.output)
-      val sorter = new ExternalSorter[Row, Null, Row](ordering = Some(ordering))
-      sorter.insertAll(iterator.map(r => (r, null)))
-      sorter.iterator.map(_._1)
-    }, preservesPartitioning = true)
+  override def upstreams(): Seq[RDD[InternalRow]] = {
+    child.asInstanceOf[CodegenSupport].upstreams()
   }
 
-  override def output = child.output
-}
+  protected override def doProduce(ctx: CodegenContext): String = {
+    child.asInstanceOf[CodegenSupport].produce(ctx, this)
+  }
 
-/**
- * :: DeveloperApi ::
- * Computes the set of distinct input rows using a HashSet.
- * @param partial when true the distinct operation is performed partially, per partition, without
- *                shuffling the data.
- * @param child the input query plan.
- */
-@DeveloperApi
-case class Distinct(partial: Boolean, child: SparkPlan) extends UnaryNode {
-  override def output = child.output
+  override def doConsume(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String = {
+    val numOutput = metricTerm(ctx, "numOutputRows")
 
-  override def requiredChildDistribution =
-    if (partial) UnspecifiedDistribution :: Nil else ClusteredDistribution(child.output) :: Nil
+    /**
+     * Generates code for `c`, using `in` for input attributes and `attrs` for nullability.
+     */
+    def genPredicate(c: Expression, in: Seq[ExprCode], attrs: Seq[Attribute]): String = {
+      val bound = BindReferences.bindReference(c, attrs)
+      val evaluated = evaluateRequiredVariables(child.output, in, c.references)
 
-  override def execute() = {
-    child.execute().mapPartitions { iter =>
-      val hashSet = new scala.collection.mutable.HashSet[Row]()
+      // Generate the code for the predicate.
+      val ev = ExpressionCanonicalizer.execute(bound).gen(ctx)
+      val nullCheck = if (bound.nullable) {
+        s"${ev.isNull} || "
+      } else {
+        s""
+      }
 
-      var currentRow: Row = null
-      while (iter.hasNext) {
-        currentRow = iter.next()
-        if (!hashSet.contains(currentRow)) {
-          hashSet.add(currentRow.copy())
+      s"""
+         |$evaluated
+         |${ev.code}
+         |if (${nullCheck}!${ev.value}) continue;
+       """.stripMargin
+    }
+
+    ctx.currentVars = input
+
+    // To generate the predicates we will follow this algorithm.
+    // For each predicate that is not IsNotNull, we will generate them one by one loading attributes
+    // as necessary. For each of both attributes, if there is a IsNotNull predicate we will generate
+    // that check *before* the predicate. After all of these predicates, we will generate the
+    // remaining IsNotNull checks that were not part of other predicates.
+    // This has the property of not doing redundant IsNotNull checks and taking better advantage of
+    // short-circuiting, not loading attributes until they are needed.
+    // This is very perf sensitive.
+    // TODO: revisit this. We can consider reordering predicates as well.
+    val generatedIsNotNullChecks = new Array[Boolean](notNullPreds.length)
+    val generated = otherPreds.map { c =>
+      val nullChecks = c.references.map { r =>
+        val idx = notNullPreds.indexWhere { n => n.asInstanceOf[IsNotNull].child.semanticEquals(r)}
+        if (idx != -1 && !generatedIsNotNullChecks(idx)) {
+          generatedIsNotNullChecks(idx) = true
+          // Use the child's output. The nullability is what the child produced.
+          genPredicate(notNullPreds(idx), input, child.output)
+        } else {
+          ""
         }
-      }
+      }.mkString("\n").trim
 
-      hashSet.iterator
+      // Here we use *this* operator's output with this output's nullability since we already
+      // enforced them with the IsNotNull checks above.
+      s"""
+         |$nullChecks
+         |${genPredicate(c, input, output)}
+       """.stripMargin.trim
+    }.mkString("\n")
+
+    val nullChecks = notNullPreds.zipWithIndex.map { case (c, idx) =>
+      if (!generatedIsNotNullChecks(idx)) {
+        genPredicate(c, input, child.output)
+      } else {
+        ""
+      }
+    }.mkString("\n")
+
+    // Reset the isNull to false for the not-null columns, then the followed operators could
+    // generate better code (remove dead branches).
+    val resultVars = input.zipWithIndex.map { case (ev, i) =>
+      if (notNullAttributes.contains(child.output(i).exprId)) {
+        ev.isNull = "false"
+      }
+      ev
+    }
+
+    s"""
+       |$generated
+       |$nullChecks
+       |$numOutput.add(1);
+       |${consume(ctx, resultVars)}
+     """.stripMargin
+  }
+
+  protected override def doExecute(): RDD[InternalRow] = {
+    val numOutputRows = longMetric("numOutputRows")
+    child.execute().mapPartitionsInternal { iter =>
+      val predicate = newPredicate(condition, child.output)
+      iter.filter { row =>
+        val r = predicate(row)
+        if (r) numOutputRows += 1
+        r
+      }
+    }
+  }
+
+  override def outputOrdering: Seq[SortOrder] = child.outputOrdering
+}
+
+/**
+ * Sample the dataset.
+ *
+ * @param lowerBound Lower-bound of the sampling probability (usually 0.0)
+ * @param upperBound Upper-bound of the sampling probability. The expected fraction sampled
+ *                   will be ub - lb.
+ * @param withReplacement Whether to sample with replacement.
+ * @param seed the random seed
+ * @param child the SparkPlan
+ */
+case class Sample(
+    lowerBound: Double,
+    upperBound: Double,
+    withReplacement: Boolean,
+    seed: Long,
+    child: SparkPlan) extends UnaryNode with CodegenSupport {
+  override def output: Seq[Attribute] = child.output
+
+  private[sql] override lazy val metrics = Map(
+    "numOutputRows" -> SQLMetrics.createLongMetric(sparkContext, "number of output rows"))
+
+  protected override def doExecute(): RDD[InternalRow] = {
+    if (withReplacement) {
+      // Disable gap sampling since the gap sampling method buffers two rows internally,
+      // requiring us to copy the row, which is more expensive than the random number generator.
+      new PartitionwiseSampledRDD[InternalRow, InternalRow](
+        child.execute(),
+        new PoissonSampler[InternalRow](upperBound - lowerBound, useGapSamplingIfPossible = false),
+        preservesPartitioning = true,
+        seed)
+    } else {
+      child.execute().randomSampleWithRange(lowerBound, upperBound, seed)
+    }
+  }
+
+  override def upstreams(): Seq[RDD[InternalRow]] = {
+    child.asInstanceOf[CodegenSupport].upstreams()
+  }
+
+  protected override def doProduce(ctx: CodegenContext): String = {
+    child.asInstanceOf[CodegenSupport].produce(ctx, this)
+  }
+
+  override def doConsume(ctx: CodegenContext, input: Seq[ExprCode], row: ExprCode): String = {
+    val numOutput = metricTerm(ctx, "numOutputRows")
+    val sampler = ctx.freshName("sampler")
+
+    if (withReplacement) {
+      val samplerClass = classOf[PoissonSampler[UnsafeRow]].getName
+      val initSampler = ctx.freshName("initSampler")
+      ctx.addMutableState(s"$samplerClass<UnsafeRow>", sampler,
+        s"$initSampler();")
+
+      ctx.addNewFunction(initSampler,
+        s"""
+          | private void $initSampler() {
+          |   $sampler = new $samplerClass<UnsafeRow>($upperBound - $lowerBound, false);
+          |   java.util.Random random = new java.util.Random(${seed}L);
+          |   long randomSeed = random.nextLong();
+          |   int loopCount = 0;
+          |   while (loopCount < partitionIndex) {
+          |     randomSeed = random.nextLong();
+          |     loopCount += 1;
+          |   }
+          |   $sampler.setSeed(randomSeed);
+          | }
+         """.stripMargin.trim)
+
+      val samplingCount = ctx.freshName("samplingCount")
+      s"""
+         | int $samplingCount = $sampler.sample();
+         | while ($samplingCount-- > 0) {
+         |   $numOutput.add(1);
+         |   ${consume(ctx, input)}
+         | }
+       """.stripMargin.trim
+    } else {
+      val samplerClass = classOf[BernoulliCellSampler[UnsafeRow]].getName
+      ctx.addMutableState(s"$samplerClass<UnsafeRow>", sampler,
+        s"""
+          | $sampler = new $samplerClass<UnsafeRow>($lowerBound, $upperBound, false);
+          | $sampler.setSeed(${seed}L + partitionIndex);
+         """.stripMargin.trim)
+
+      s"""
+         | if ($sampler.sample() == 0) continue;
+         | $numOutput.add(1);
+         | ${consume(ctx, input)}
+       """.stripMargin.trim
     }
   }
 }
 
+case class Range(
+    start: Long,
+    step: Long,
+    numSlices: Int,
+    numElements: BigInt,
+    output: Seq[Attribute])
+  extends LeafNode with CodegenSupport {
+
+  private[sql] override lazy val metrics = Map(
+    "numOutputRows" -> SQLMetrics.createLongMetric(sparkContext, "number of output rows"))
+
+  // output attributes should not affect the results
+  override lazy val cleanArgs: Seq[Any] = Seq(start, step, numSlices, numElements)
+
+  override def upstreams(): Seq[RDD[InternalRow]] = {
+    sqlContext.sparkContext.parallelize(0 until numSlices, numSlices)
+      .map(i => InternalRow(i)) :: Nil
+  }
+
+  protected override def doProduce(ctx: CodegenContext): String = {
+    val numOutput = metricTerm(ctx, "numOutputRows")
+
+    val initTerm = ctx.freshName("initRange")
+    ctx.addMutableState("boolean", initTerm, s"$initTerm = false;")
+    val partitionEnd = ctx.freshName("partitionEnd")
+    ctx.addMutableState("long", partitionEnd, s"$partitionEnd = 0L;")
+    val number = ctx.freshName("number")
+    ctx.addMutableState("long", number, s"$number = 0L;")
+    val overflow = ctx.freshName("overflow")
+    ctx.addMutableState("boolean", overflow, s"$overflow = false;")
+
+    val value = ctx.freshName("value")
+    val ev = ExprCode("", "false", value)
+    val BigInt = classOf[java.math.BigInteger].getName
+    val checkEnd = if (step > 0) {
+      s"$number < $partitionEnd"
+    } else {
+      s"$number > $partitionEnd"
+    }
+
+    ctx.addNewFunction("initRange",
+      s"""
+        | private void initRange(int idx) {
+        |   $BigInt index = $BigInt.valueOf(idx);
+        |   $BigInt numSlice = $BigInt.valueOf(${numSlices}L);
+        |   $BigInt numElement = $BigInt.valueOf(${numElements.toLong}L);
+        |   $BigInt step = $BigInt.valueOf(${step}L);
+        |   $BigInt start = $BigInt.valueOf(${start}L);
+        |
+        |   $BigInt st = index.multiply(numElement).divide(numSlice).multiply(step).add(start);
+        |   if (st.compareTo($BigInt.valueOf(Long.MAX_VALUE)) > 0) {
+        |     $number = Long.MAX_VALUE;
+        |   } else if (st.compareTo($BigInt.valueOf(Long.MIN_VALUE)) < 0) {
+        |     $number = Long.MIN_VALUE;
+        |   } else {
+        |     $number = st.longValue();
+        |   }
+        |
+        |   $BigInt end = index.add($BigInt.ONE).multiply(numElement).divide(numSlice)
+        |     .multiply(step).add(start);
+        |   if (end.compareTo($BigInt.valueOf(Long.MAX_VALUE)) > 0) {
+        |     $partitionEnd = Long.MAX_VALUE;
+        |   } else if (end.compareTo($BigInt.valueOf(Long.MIN_VALUE)) < 0) {
+        |     $partitionEnd = Long.MIN_VALUE;
+        |   } else {
+        |     $partitionEnd = end.longValue();
+        |   }
+        |
+        |   $numOutput.add(($partitionEnd - $number) / ${step}L);
+        | }
+       """.stripMargin)
+
+    val input = ctx.freshName("input")
+    // Right now, Range is only used when there is one upstream.
+    ctx.addMutableState("scala.collection.Iterator", input, s"$input = inputs[0];")
+    s"""
+      | // initialize Range
+      | if (!$initTerm) {
+      |   $initTerm = true;
+      |   initRange(partitionIndex);
+      | }
+      |
+      | while (!$overflow && $checkEnd) {
+      |  long $value = $number;
+      |  $number += ${step}L;
+      |  if ($number < $value ^ ${step}L < 0) {
+      |    $overflow = true;
+      |  }
+      |  ${consume(ctx, Seq(ev))}
+      |  if (shouldStop()) return;
+      | }
+     """.stripMargin
+  }
+
+  protected override def doExecute(): RDD[InternalRow] = {
+    val numOutputRows = longMetric("numOutputRows")
+    sqlContext
+      .sparkContext
+      .parallelize(0 until numSlices, numSlices)
+      .mapPartitionsWithIndex((i, _) => {
+        val partitionStart = (i * numElements) / numSlices * step + start
+        val partitionEnd = (((i + 1) * numElements) / numSlices) * step + start
+        def getSafeMargin(bi: BigInt): Long =
+          if (bi.isValidLong) {
+            bi.toLong
+          } else if (bi > 0) {
+            Long.MaxValue
+          } else {
+            Long.MinValue
+          }
+        val safePartitionStart = getSafeMargin(partitionStart)
+        val safePartitionEnd = getSafeMargin(partitionEnd)
+        val rowSize = UnsafeRow.calculateBitSetWidthInBytes(1) + LongType.defaultSize
+        val unsafeRow = UnsafeRow.createFromByteArray(rowSize, 1)
+
+        new Iterator[InternalRow] {
+          private[this] var number: Long = safePartitionStart
+          private[this] var overflow: Boolean = false
+
+          override def hasNext =
+            if (!overflow) {
+              if (step > 0) {
+                number < safePartitionEnd
+              } else {
+                number > safePartitionEnd
+              }
+            } else false
+
+          override def next() = {
+            val ret = number
+            number += step
+            if (number < ret ^ step < 0) {
+              // we have Long.MaxValue + Long.MaxValue < Long.MaxValue
+              // and Long.MinValue + Long.MinValue > Long.MinValue, so iff the step causes a step
+              // back, we are pretty sure that we have an overflow.
+              overflow = true
+            }
+
+            numOutputRows += 1
+            unsafeRow.setLong(0, ret)
+            unsafeRow
+          }
+        }
+      })
+  }
+}
 
 /**
- * :: DeveloperApi ::
+ * Union two plans, without a distinct. This is UNION ALL in SQL.
+ */
+case class Union(children: Seq[SparkPlan]) extends SparkPlan {
+  override def output: Seq[Attribute] =
+    children.map(_.output).transpose.map(attrs =>
+      attrs.head.withNullability(attrs.exists(_.nullable)))
+
+  protected override def doExecute(): RDD[InternalRow] =
+    sparkContext.union(children.map(_.execute()))
+}
+
+/**
+ * Return a new RDD that has exactly `numPartitions` partitions.
+ * Similar to coalesce defined on an [[RDD]], this operation results in a narrow dependency, e.g.
+ * if you go from 1000 partitions to 100 partitions, there will not be a shuffle, instead each of
+ * the 100 new partitions will claim 10 of the current partitions.
+ */
+case class Coalesce(numPartitions: Int, child: SparkPlan) extends UnaryNode {
+  override def output: Seq[Attribute] = child.output
+
+  override def outputPartitioning: Partitioning = {
+    if (numPartitions == 1) SinglePartition
+    else UnknownPartitioning(numPartitions)
+  }
+
+  protected override def doExecute(): RDD[InternalRow] = {
+    child.execute().coalesce(numPartitions, shuffle = false)
+  }
+}
+
+/**
  * Returns a table with the elements from left that are not in right using
  * the built-in spark subtract function.
  */
-@DeveloperApi
 case class Except(left: SparkPlan, right: SparkPlan) extends BinaryNode {
-  override def output = left.output
+  override def output: Seq[Attribute] = left.output
 
-  override def execute() = {
+  protected override def doExecute(): RDD[InternalRow] = {
     left.execute().map(_.copy()).subtract(right.execute().map(_.copy()))
   }
 }
 
 /**
- * :: DeveloperApi ::
- * Returns the rows in left that also appear in right using the built in spark
- * intersection function.
- */
-@DeveloperApi
-case class Intersect(left: SparkPlan, right: SparkPlan) extends BinaryNode {
-  override def output = children.head.output
-
-  override def execute() = {
-    left.execute().map(_.copy()).intersection(right.execute().map(_.copy()))
-  }
-}
-
-/**
- * :: DeveloperApi ::
  * A plan node that does nothing but lie about the output of its child.  Used to spice a
  * (hopefully structurally equivalent) tree from a different optimization sequence into an already
  * resolved tree.
  */
-@DeveloperApi
 case class OutputFaker(output: Seq[Attribute], child: SparkPlan) extends SparkPlan {
-  def children = child :: Nil
-  def execute() = child.execute()
+  def children: Seq[SparkPlan] = child :: Nil
+
+  protected override def doExecute(): RDD[InternalRow] = child.execute()
+}
+
+/**
+ * A plan as subquery.
+ *
+ * This is used to generate tree string for SparkScalarSubquery.
+ */
+case class Subquery(name: String, child: SparkPlan) extends UnaryNode {
+  override def output: Seq[Attribute] = child.output
+  override def outputPartitioning: Partitioning = child.outputPartitioning
+  override def outputOrdering: Seq[SortOrder] = child.outputOrdering
+
+  protected override def doExecute(): RDD[InternalRow] = {
+    throw new UnsupportedOperationException
+  }
 }

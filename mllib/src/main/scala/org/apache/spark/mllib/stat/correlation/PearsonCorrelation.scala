@@ -19,7 +19,7 @@ package org.apache.spark.mllib.stat.correlation
 
 import breeze.linalg.{DenseMatrix => BDM}
 
-import org.apache.spark.Logging
+import org.apache.spark.internal.Logging
 import org.apache.spark.mllib.linalg.{Matrices, Matrix, Vector}
 import org.apache.spark.mllib.linalg.distributed.RowMatrix
 import org.apache.spark.rdd.RDD
@@ -101,7 +101,7 @@ private[stat] object PearsonCorrelation extends Correlation with Logging {
     Matrices.fromBreeze(cov)
   }
 
-  private def closeToZero(value: Double, threshhold: Double = 1e-12): Boolean = {
-    math.abs(value) <= threshhold
+  private def closeToZero(value: Double, threshold: Double = 1e-12): Boolean = {
+    math.abs(value) <= threshold
   }
 }

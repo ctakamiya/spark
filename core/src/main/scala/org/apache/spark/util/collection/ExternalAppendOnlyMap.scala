@@ -26,12 +26,15 @@ import scala.collection.mutable.ArrayBuffer
 
 import com.google.common.io.ByteStreams
 
-import org.apache.spark.{Logging, SparkEnv}
+import org.apache.spark.{SparkEnv, TaskContext}
 import org.apache.spark.annotation.DeveloperApi
-import org.apache.spark.serializer.{DeserializationStream, Serializer}
-import org.apache.spark.storage.{BlockId, BlockManager}
-import org.apache.spark.util.collection.ExternalAppendOnlyMap.HashComparator
 import org.apache.spark.executor.ShuffleWriteMetrics
+import org.apache.spark.internal.Logging
+import org.apache.spark.memory.TaskMemoryManager
+import org.apache.spark.serializer.{DeserializationStream, Serializer, SerializerManager}
+import org.apache.spark.storage.{BlockId, BlockManager}
+import org.apache.spark.util.CompletionIterator
+import org.apache.spark.util.collection.ExternalAppendOnlyMap.HashComparator
 
 /**
  * :: DeveloperApi ::
@@ -48,16 +51,6 @@ import org.apache.spark.executor.ShuffleWriteMetrics
  * However, if the spill threshold is too low, we spill frequently and incur unnecessary disk
  * writes. This may lead to a performance regression compared to the normal case of using the
  * non-spilling AppendOnlyMap.
- *
- * Two parameters control the memory threshold:
- *
- *   `spark.shuffle.memoryFraction` specifies the collective amount of memory used for storing
- *   these maps as a fraction of the executor's total memory. Since each concurrently running
- *   task maintains one map, the actual threshold for each map is this quantity divided by the
- *   number of running tasks.
- *
- *   `spark.shuffle.safetyFraction` specifies an additional margin of safety as a fraction of
- *   this threshold, in case map size estimation is not sufficiently accurate.
  */
 @DeveloperApi
 class ExternalAppendOnlyMap[K, V, C](
@@ -65,11 +58,30 @@ class ExternalAppendOnlyMap[K, V, C](
     mergeValue: (C, V) => C,
     mergeCombiners: (C, C) => C,
     serializer: Serializer = SparkEnv.get.serializer,
-    blockManager: BlockManager = SparkEnv.get.blockManager)
+    blockManager: BlockManager = SparkEnv.get.blockManager,
+    context: TaskContext = TaskContext.get(),
+    serializerManager: SerializerManager = SparkEnv.get.serializerManager)
   extends Iterable[(K, C)]
   with Serializable
   with Logging
   with Spillable[SizeTracker] {
+
+  if (context == null) {
+    throw new IllegalStateException(
+      "Spillable collections should not be instantiated outside of tasks")
+  }
+
+  // Backwards-compatibility constructor for binary compatibility
+  def this(
+      createCombiner: V => C,
+      mergeValue: (C, V) => C,
+      mergeCombiners: (C, C) => C,
+      serializer: Serializer,
+      blockManager: BlockManager) {
+    this(createCombiner, mergeValue, mergeCombiners, serializer, blockManager, TaskContext.get())
+  }
+
+  override protected[this] def taskMemoryManager: TaskMemoryManager = context.taskMemoryManager()
 
   private var currentMap = new SizeTrackingAppendOnlyMap[K, C]
   private val spilledMaps = new ArrayBuffer[DiskMapIterator]
@@ -89,14 +101,27 @@ class ExternalAppendOnlyMap[K, V, C](
 
   // Number of bytes spilled in total
   private var _diskBytesSpilled = 0L
+  def diskBytesSpilled: Long = _diskBytesSpilled
 
-  private val fileBufferSize = sparkConf.getInt("spark.shuffle.file.buffer.kb", 32) * 1024
+  // Use getSizeAsKb (not bytes) to maintain backwards compatibility if no units are provided
+  private val fileBufferSize =
+    sparkConf.getSizeAsKb("spark.shuffle.file.buffer", "32k").toInt * 1024
 
   // Write metrics for current spill
   private var curWriteMetrics: ShuffleWriteMetrics = _
 
+  // Peak size of the in-memory map observed so far, in bytes
+  private var _peakMemoryUsedBytes: Long = 0L
+  def peakMemoryUsedBytes: Long = _peakMemoryUsedBytes
+
   private val keyComparator = new HashComparator[K]
   private val ser = serializer.newInstance()
+
+  /**
+   * Number of files this map has spilled so far.
+   * Exposed for testing.
+   */
+  private[collection] def numSpills: Int = spilledMaps.size
 
   /**
    * Insert the given key and value into the map.
@@ -115,6 +140,10 @@ class ExternalAppendOnlyMap[K, V, C](
    * The shuffle memory usage of the first trackMemoryThreshold entries is not tracked.
    */
   def insertAll(entries: Iterator[Product2[K, V]]): Unit = {
+    if (currentMap == null) {
+      throw new IllegalStateException(
+        "Cannot insert new elements into a map after calling iterator")
+    }
     // An update function for the map that we reuse across entries to avoid allocating
     // a new closure each time
     var curEntry: Product2[K, V] = null
@@ -124,7 +153,11 @@ class ExternalAppendOnlyMap[K, V, C](
 
     while (entries.hasNext) {
       curEntry = entries.next()
-      if (maybeSpill(currentMap, currentMap.estimateSize())) {
+      val estimatedSize = currentMap.estimateSize()
+      if (estimatedSize > _peakMemoryUsedBytes) {
+        _peakMemoryUsedBytes = estimatedSize
+      }
+      if (maybeSpill(currentMap, estimatedSize)) {
         currentMap = new SizeTrackingAppendOnlyMap[K, C]
       }
       currentMap.changeValue(curEntry._1, update)
@@ -151,20 +184,19 @@ class ExternalAppendOnlyMap[K, V, C](
   override protected[this] def spill(collection: SizeTracker): Unit = {
     val (blockId, file) = diskBlockManager.createTempLocalBlock()
     curWriteMetrics = new ShuffleWriteMetrics()
-    var writer = blockManager.getDiskWriter(blockId, file, serializer, fileBufferSize,
-      curWriteMetrics)
+    var writer = blockManager.getDiskWriter(blockId, file, ser, fileBufferSize, curWriteMetrics)
     var objectsWritten = 0
 
     // List of batch sizes (bytes) in the order they are written to disk
     val batchSizes = new ArrayBuffer[Long]
 
     // Flush the disk writer's contents to disk, and update relevant variables
-    def flush() = {
+    def flush(): Unit = {
       val w = writer
       writer = null
       w.commitAndClose()
-      _diskBytesSpilled += curWriteMetrics.shuffleBytesWritten
-      batchSizes.append(curWriteMetrics.shuffleBytesWritten)
+      _diskBytesSpilled += curWriteMetrics.bytesWritten
+      batchSizes.append(curWriteMetrics.bytesWritten)
       objectsWritten = 0
     }
 
@@ -173,14 +205,13 @@ class ExternalAppendOnlyMap[K, V, C](
       val it = currentMap.destructiveSortedIterator(keyComparator)
       while (it.hasNext) {
         val kv = it.next()
-        writer.write(kv)
+        writer.write(kv._1, kv._2)
         objectsWritten += 1
 
         if (objectsWritten == serializerBatchSize) {
           flush()
           curWriteMetrics = new ShuffleWriteMetrics()
-          writer = blockManager.getDiskWriter(blockId, file, serializer, fileBufferSize,
-            curWriteMetrics)
+          writer = blockManager.getDiskWriter(blockId, file, ser, fileBufferSize, curWriteMetrics)
         }
       }
       if (objectsWritten > 0) {
@@ -199,7 +230,9 @@ class ExternalAppendOnlyMap[K, V, C](
           writer.revertPartialWritesAndClose()
         }
         if (file.exists()) {
-          file.delete()
+          if (!file.delete()) {
+            logWarning(s"Error deleting ${file}")
+          }
         }
       }
     }
@@ -207,18 +240,25 @@ class ExternalAppendOnlyMap[K, V, C](
     spilledMaps.append(new DiskMapIterator(file, blockId, batchSizes))
   }
 
-  def diskBytesSpilled: Long = _diskBytesSpilled
-
   /**
-   * Return an iterator that merges the in-memory map with the spilled maps.
+   * Return a destructive iterator that merges the in-memory map with the spilled maps.
    * If no spill has occurred, simply return the in-memory map's iterator.
    */
   override def iterator: Iterator[(K, C)] = {
+    if (currentMap == null) {
+      throw new IllegalStateException(
+        "ExternalAppendOnlyMap.iterator is destructive and should only be called once.")
+    }
     if (spilledMaps.isEmpty) {
-      currentMap.iterator
+      CompletionIterator[(K, C), Iterator[(K, C)]](currentMap.iterator, freeCurrentMap())
     } else {
       new ExternalIterator()
     }
+  }
+
+  private def freeCurrentMap(): Unit = {
+    currentMap = null // So that the memory can be garbage-collected
+    releaseMemory()
   }
 
   /**
@@ -232,7 +272,8 @@ class ExternalAppendOnlyMap[K, V, C](
 
     // Input streams are derived both from the in-memory map and spilled maps on disk
     // The in-memory map is sorted in place, while the spilled maps are already in sorted order
-    private val sortedMap = currentMap.destructiveSortedIterator(keyComparator)
+    private val sortedMap = CompletionIterator[(K, C), Iterator[(K, C)]](
+      currentMap.destructiveSortedIterator(keyComparator), freeCurrentMap())
     private val inputStreams = (Seq(sortedMap) ++ spilledMaps).map(it => it.buffered)
 
     inputStreams.foreach { it =>
@@ -355,7 +396,7 @@ class ExternalAppendOnlyMap[K, V, C](
         val pairs: ArrayBuffer[(K, C)])
       extends Comparable[StreamBuffer] {
 
-      def isEmpty = pairs.length == 0
+      def isEmpty: Boolean = pairs.length == 0
 
       // Invalid if there are no more pairs in this stream
       def minKeyHash: Int = {
@@ -387,15 +428,6 @@ class ExternalAppendOnlyMap[K, V, C](
     private var batchIndex = 0  // Which batch we're in
     private var fileStream: FileInputStream = null
 
-    @volatile private var closed = false
-
-    // A volatile variable to remember which DeserializationStream is using. Need to set it when we
-    // open a DeserializationStream. But we should use `deserializeStream` rather than
-    // `deserializeStreamToBeClosed` to read the content because touching a volatile variable will
-    // reduce the performance. It must be volatile so that we can see its correct value in the
-    // `finalize` method, which could run in any thread.
-    @volatile private var deserializeStreamToBeClosed: DeserializationStream = null
-
     // An intermediate stream that reads from exactly one batch
     // This guards against pre-fetching and other arbitrary behavior of higher level streams
     private var deserializeStream = nextBatchStream()
@@ -410,7 +442,6 @@ class ExternalAppendOnlyMap[K, V, C](
       // we're still in a valid batch.
       if (batchIndex < batchOffsets.length - 1) {
         if (deserializeStream != null) {
-          deserializeStreamToBeClosed = null
           deserializeStream.close()
           fileStream.close()
           deserializeStream = null
@@ -428,12 +459,8 @@ class ExternalAppendOnlyMap[K, V, C](
           ", batchOffsets = " + batchOffsets.mkString("[", ", ", "]"))
 
         val bufferedStream = new BufferedInputStream(ByteStreams.limit(fileStream, end - start))
-        val compressedStream = blockManager.wrapForCompression(blockId, bufferedStream)
-        // Before returning the stream, assign it to `deserializeStreamToBeClosed` so that we can
-        // close it in `finalize` and also avoid to touch the volatile `deserializeStreamToBeClosed`
-        // during reading the (K, C) pairs.
-        deserializeStreamToBeClosed = ser.deserializeStream(compressedStream)
-        deserializeStreamToBeClosed
+        val compressedStream = serializerManager.wrapForCompression(blockId, bufferedStream)
+        ser.deserializeStream(compressedStream)
       } else {
         // No more batches left
         cleanup()
@@ -449,7 +476,9 @@ class ExternalAppendOnlyMap[K, V, C](
      */
     private def readNextItem(): (K, C) = {
       try {
-        val item = deserializeStream.readObject().asInstanceOf[(K, C)]
+        val k = deserializeStream.readKey().asInstanceOf[K]
+        val c = deserializeStream.readValue().asInstanceOf[C]
+        val item = (k, c)
         objectsRead += 1
         if (objectsRead == serializerBatchSize) {
           objectsRead = 0
@@ -482,35 +511,25 @@ class ExternalAppendOnlyMap[K, V, C](
       item
     }
 
-    // TODO: Now only use `finalize` to ensure `close` gets called to clean up the resources. In the
-    // future, we need some mechanism to ensure this gets called once the resources are not used.
-    private def cleanup(): Unit = {
-      if (!closed) {
-        closed = true
-        batchIndex = batchOffsets.length  // Prevent reading any other batch
+    private def cleanup() {
+      batchIndex = batchOffsets.length  // Prevent reading any other batch
+      val ds = deserializeStream
+      if (ds != null) {
+        ds.close()
+        deserializeStream = null
+      }
+      if (fileStream != null) {
+        fileStream.close()
         fileStream = null
-        try {
-          val ds = deserializeStreamToBeClosed
-          deserializeStreamToBeClosed = null
-          deserializeStream = null
-          if (ds != null) {
-            ds.close()
-          }
-        } finally {
-          if (file.exists()) {
-            file.delete()
-          }
+      }
+      if (file.exists()) {
+        if (!file.delete()) {
+          logWarning(s"Error deleting ${file}")
         }
       }
     }
 
-    override def finalize(): Unit = {
-      try {
-        cleanup()
-      } finally {
-        super.finalize()
-      }
-    }
+    context.addTaskCompletionListener(context => cleanup())
   }
 
   /** Convenience function to hash the given (K, C) pair by the key. */

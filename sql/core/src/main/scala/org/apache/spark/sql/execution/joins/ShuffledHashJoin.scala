@@ -17,34 +17,60 @@
 
 package org.apache.spark.sql.execution.joins
 
-import org.apache.spark.annotation.DeveloperApi
-import org.apache.spark.sql.catalyst.expressions.Expression
-import org.apache.spark.sql.catalyst.plans.physical.{ClusteredDistribution, Partitioning}
+import org.apache.spark.TaskContext
+import org.apache.spark.rdd.RDD
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.expressions.{BindReferences, Expression, UnsafeRow}
+import org.apache.spark.sql.catalyst.plans._
+import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.execution.{BinaryNode, SparkPlan}
+import org.apache.spark.sql.execution.metric.SQLMetrics
 
 /**
- * :: DeveloperApi ::
- * Performs an inner hash join of two child relations by first shuffling the data using the join
- * keys.
+ * Performs a hash join of two child relations by first shuffling the data using the join keys.
  */
-@DeveloperApi
 case class ShuffledHashJoin(
     leftKeys: Seq[Expression],
     rightKeys: Seq[Expression],
+    joinType: JoinType,
     buildSide: BuildSide,
+    condition: Option[Expression],
     left: SparkPlan,
     right: SparkPlan)
   extends BinaryNode with HashJoin {
 
-  override def outputPartitioning: Partitioning = left.outputPartitioning
+  override private[sql] lazy val metrics = Map(
+    "numOutputRows" -> SQLMetrics.createLongMetric(sparkContext, "number of output rows"))
 
-  override def requiredChildDistribution =
+  override def outputPartitioning: Partitioning = joinType match {
+    case Inner => PartitioningCollection(Seq(left.outputPartitioning, right.outputPartitioning))
+    case LeftAnti => left.outputPartitioning
+    case LeftSemi => left.outputPartitioning
+    case LeftOuter => left.outputPartitioning
+    case RightOuter => right.outputPartitioning
+    case FullOuter => UnknownPartitioning(left.outputPartitioning.numPartitions)
+    case x =>
+      throw new IllegalArgumentException(s"ShuffledHashJoin should not take $x as the JoinType")
+  }
+
+  override def requiredChildDistribution: Seq[Distribution] =
     ClusteredDistribution(leftKeys) :: ClusteredDistribution(rightKeys) :: Nil
 
-  override def execute() = {
-    buildPlan.execute().zipPartitions(streamedPlan.execute()) { (buildIter, streamIter) =>
-      val hashed = HashedRelation(buildIter, buildSideKeyGenerator)
-      hashJoin(streamIter, hashed)
+  private def buildHashedRelation(iter: Iterator[InternalRow]): HashedRelation = {
+    val context = TaskContext.get()
+    val relation = HashedRelation(iter, buildKeys, taskMemoryManager = context.taskMemoryManager())
+    // This relation is usually used until the end of task.
+    context.addTaskCompletionListener((t: TaskContext) =>
+      relation.close()
+    )
+    relation
+  }
+
+  protected override def doExecute(): RDD[InternalRow] = {
+    val numOutputRows = longMetric("numOutputRows")
+    streamedPlan.execute().zipPartitions(buildPlan.execute()) { (streamIter, buildIter) =>
+      val hashed = buildHashedRelation(buildIter)
+      join(streamIter, hashed, numOutputRows)
     }
   }
 }

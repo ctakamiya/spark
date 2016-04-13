@@ -15,7 +15,7 @@
 # limitations under the License.
 #
 
-from pyspark.ml.param import *
-from pyspark.ml.pipeline import *
+from pyspark.ml.base import Estimator, Model, Transformer
+from pyspark.ml.pipeline import Pipeline, PipelineModel
 
-__all__ = ["Param", "Params", "Transformer", "Estimator", "Pipeline"]
+__all__ = ["Transformer", "Estimator", "Model", "Pipeline", "PipelineModel"]

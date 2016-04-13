@@ -19,14 +19,15 @@ package org.apache.spark.mllib.linalg
 
 import java.util.Random
 
+import breeze.linalg.{CSCMatrix, Matrix => BM}
 import org.mockito.Mockito.when
-import org.scalatest.FunSuite
 import org.scalatest.mock.MockitoSugar._
 import scala.collection.mutable.{Map => MutableMap}
 
+import org.apache.spark.SparkFunSuite
 import org.apache.spark.mllib.util.TestingUtils._
 
-class MatricesSuite extends FunSuite {
+class MatricesSuite extends SparkFunSuite {
   test("dense matrix construction") {
     val m = 3
     val n = 2
@@ -74,6 +75,35 @@ class MatricesSuite extends FunSuite {
     }
   }
 
+  test("index in matrices incorrect input") {
+    val sm = Matrices.sparse(3, 2, Array(0, 2, 3), Array(1, 2, 1), Array(0.0, 1.0, 2.0))
+    val dm = Matrices.dense(3, 2, Array(0.0, 2.3, 1.4, 3.2, 1.0, 9.1))
+    Array(sm, dm).foreach { mat =>
+      intercept[IllegalArgumentException] { mat.index(4, 1) }
+      intercept[IllegalArgumentException] { mat.index(1, 4) }
+      intercept[IllegalArgumentException] { mat.index(-1, 2) }
+      intercept[IllegalArgumentException] { mat.index(1, -2) }
+    }
+  }
+
+  test("equals") {
+    val dm1 = Matrices.dense(2, 2, Array(0.0, 1.0, 2.0, 3.0))
+    assert(dm1 === dm1)
+    assert(dm1 !== dm1.transpose)
+
+    val dm2 = Matrices.dense(2, 2, Array(0.0, 2.0, 1.0, 3.0))
+    assert(dm1 === dm2.transpose)
+
+    val sm1 = dm1.asInstanceOf[DenseMatrix].toSparse
+    assert(sm1 === sm1)
+    assert(sm1 === dm1)
+    assert(sm1 !== sm1.transpose)
+
+    val sm2 = dm2.asInstanceOf[DenseMatrix].toSparse
+    assert(sm1 === sm2.transpose)
+    assert(sm1 === dm2.transpose)
+  }
+
   test("matrix copies are deep copies") {
     val m = 3
     val n = 2
@@ -119,6 +149,10 @@ class MatricesSuite extends FunSuite {
 
     intercept[NoSuchElementException] {
       sparseMat.update(0, 0, 10.0)
+    }
+
+    intercept[NoSuchElementException] {
+      sparseMat.update(2, 1, 10.0)
     }
 
     sparseMat.update(0, 1, 10.0)
@@ -423,5 +457,70 @@ class MatricesSuite extends FunSuite {
     assert(mat.numCols === 4)
     assert(mat.rowIndices.toSeq === Seq(3, 0, 2, 1))
     assert(mat.values.toSeq === Seq(1.0, 2.0, 3.0, 4.0))
+  }
+
+  test("MatrixUDT") {
+    val dm1 = new DenseMatrix(2, 2, Array(0.9, 1.2, 2.3, 9.8))
+    val dm2 = new DenseMatrix(3, 2, Array(0.0, 1.21, 2.3, 9.8, 9.0, 0.0))
+    val dm3 = new DenseMatrix(0, 0, Array())
+    val sm1 = dm1.toSparse
+    val sm2 = dm2.toSparse
+    val sm3 = dm3.toSparse
+    val mUDT = new MatrixUDT()
+    Seq(dm1, dm2, dm3, sm1, sm2, sm3).foreach {
+        mat => assert(mat.toArray === mUDT.deserialize(mUDT.serialize(mat)).toArray)
+    }
+    assert(mUDT.typeName == "matrix")
+    assert(mUDT.simpleString == "matrix")
+  }
+
+  test("toString") {
+    val empty = Matrices.ones(0, 0)
+    empty.toString(0, 0)
+
+    val mat = Matrices.rand(5, 10, new Random())
+    mat.toString(-1, -5)
+    mat.toString(0, 0)
+    mat.toString(Int.MinValue, Int.MinValue)
+    mat.toString(Int.MaxValue, Int.MaxValue)
+    var lines = mat.toString(6, 50).lines.toArray
+    assert(lines.size == 5 && lines.forall(_.size <= 50))
+
+    lines = mat.toString(5, 100).lines.toArray
+    assert(lines.size == 5 && lines.forall(_.size <= 100))
+  }
+
+  test("numNonzeros and numActives") {
+    val dm1 = Matrices.dense(3, 2, Array(0, 0, -1, 1, 0, 1))
+    assert(dm1.numNonzeros === 3)
+    assert(dm1.numActives === 6)
+
+    val sm1 = Matrices.sparse(3, 2, Array(0, 2, 3), Array(0, 2, 1), Array(0.0, -1.2, 0.0))
+    assert(sm1.numNonzeros === 1)
+    assert(sm1.numActives === 3)
+  }
+
+  test("fromBreeze with sparse matrix") {
+    // colPtr.last does NOT always equal to values.length in breeze SCSMatrix and
+    // invocation of compact() may be necessary. Refer to SPARK-11507
+    val bm1: BM[Double] = new CSCMatrix[Double](
+      Array(1.0, 1, 1), 3, 3, Array(0, 1, 2, 3), Array(0, 1, 2))
+    val bm2: BM[Double] = new CSCMatrix[Double](
+      Array(1.0, 2, 2, 4), 3, 3, Array(0, 0, 2, 4), Array(1, 2, 1, 2))
+    val sum = bm1 + bm2
+    Matrices.fromBreeze(sum)
+  }
+
+  test("row/col iterator") {
+    val dm = new DenseMatrix(3, 2, Array(0, 1, 2, 3, 4, 0))
+    val sm = dm.toSparse
+    val rows = Seq(Vectors.dense(0, 3), Vectors.dense(1, 4), Vectors.dense(2, 0))
+    val cols = Seq(Vectors.dense(0, 1, 2), Vectors.dense(3, 4, 0))
+    for (m <- Seq(dm, sm)) {
+      assert(m.rowIter.toSeq === rows)
+      assert(m.colIter.toSeq === cols)
+      assert(m.transpose.rowIter.toSeq === cols)
+      assert(m.transpose.colIter.toSeq === rows)
+    }
   }
 }

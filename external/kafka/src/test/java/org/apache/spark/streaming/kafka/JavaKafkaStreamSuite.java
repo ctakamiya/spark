@@ -18,41 +18,35 @@
 package org.apache.spark.streaming.kafka;
 
 import java.io.Serializable;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Random;
+import java.util.*;
 
-import org.apache.spark.SparkConf;
-import org.apache.spark.streaming.Duration;
-import scala.Predef;
 import scala.Tuple2;
-import scala.collection.JavaConverters;
-
-import junit.framework.Assert;
 
 import kafka.serializer.StringDecoder;
+import org.junit.After;
+import org.junit.Assert;
+import org.junit.Before;
+import org.junit.Test;
 
+import org.apache.spark.SparkConf;
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.function.Function;
+import org.apache.spark.api.java.function.VoidFunction;
 import org.apache.spark.storage.StorageLevel;
+import org.apache.spark.streaming.Duration;
 import org.apache.spark.streaming.api.java.JavaDStream;
 import org.apache.spark.streaming.api.java.JavaPairDStream;
 import org.apache.spark.streaming.api.java.JavaStreamingContext;
 
-import org.junit.Test;
-import org.junit.After;
-import org.junit.Before;
-
 public class JavaKafkaStreamSuite implements Serializable {
   private transient JavaStreamingContext ssc = null;
   private transient Random random = new Random();
-  private transient KafkaStreamSuiteBase suiteBase = null;
+  private transient KafkaTestUtils kafkaTestUtils = null;
 
   @Before
   public void setUp() {
-    suiteBase = new KafkaStreamSuiteBase() { };
-    suiteBase.setupKafka();
-    System.clearProperty("spark.driver.port");
+    kafkaTestUtils = new KafkaTestUtils();
+    kafkaTestUtils.setup();
     SparkConf sparkConf = new SparkConf()
       .setMaster("local[4]").setAppName(this.getClass().getSimpleName());
     ssc = new JavaStreamingContext(sparkConf, new Duration(500));
@@ -60,32 +54,33 @@ public class JavaKafkaStreamSuite implements Serializable {
 
   @After
   public void tearDown() {
-    ssc.stop();
-    ssc = null;
-    System.clearProperty("spark.driver.port");
-    suiteBase.tearDownKafka();
+    if (ssc != null) {
+      ssc.stop();
+      ssc = null;
+    }
+
+    if (kafkaTestUtils != null) {
+      kafkaTestUtils.teardown();
+      kafkaTestUtils = null;
+    }
   }
 
   @Test
   public void testKafkaStream() throws InterruptedException {
     String topic = "topic1";
-    HashMap<String, Integer> topics = new HashMap<String, Integer>();
+    Map<String, Integer> topics = new HashMap<>();
     topics.put(topic, 1);
 
-    HashMap<String, Integer> sent = new HashMap<String, Integer>();
+    Map<String, Integer> sent = new HashMap<>();
     sent.put("a", 5);
     sent.put("b", 3);
     sent.put("c", 10);
 
-    suiteBase.createTopic(topic);
-    HashMap<String, Object> tmp = new HashMap<String, Object>(sent);
-    suiteBase.sendMessages(topic,
-        JavaConverters.mapAsScalaMapConverter(tmp).asScala().toMap(
-            Predef.<Tuple2<String, Object>>conforms())
-    );
+    kafkaTestUtils.createTopic(topic, 1);
+    kafkaTestUtils.sendMessages(topic, sent);
 
-    HashMap<String, String> kafkaParams = new HashMap<String, String>();
-    kafkaParams.put("zookeeper.connect", suiteBase.zkAddress());
+    Map<String, String> kafkaParams = new HashMap<>();
+    kafkaParams.put("zookeeper.connect", kafkaTestUtils.zkAddress());
     kafkaParams.put("group.id", "test-consumer-" + random.nextInt(10000));
     kafkaParams.put("auto.offset.reset", "smallest");
 
@@ -98,21 +93,20 @@ public class JavaKafkaStreamSuite implements Serializable {
       topics,
       StorageLevel.MEMORY_ONLY_SER());
 
-    final HashMap<String, Long> result = new HashMap<String, Long>();
+    final Map<String, Long> result = Collections.synchronizedMap(new HashMap<String, Long>());
 
     JavaDStream<String> words = stream.map(
       new Function<Tuple2<String, String>, String>() {
         @Override
-        public String call(Tuple2<String, String> tuple2) throws Exception {
+        public String call(Tuple2<String, String> tuple2) {
           return tuple2._2();
         }
       }
     );
 
-    words.countByValue().foreachRDD(
-      new Function<JavaPairRDD<String, Long>, Void>() {
+    words.countByValue().foreachRDD(new VoidFunction<JavaPairRDD<String, Long>>() {
         @Override
-        public Void call(JavaPairRDD<String, Long> rdd) throws Exception {
+        public void call(JavaPairRDD<String, Long> rdd) {
           List<Tuple2<String, Long>> ret = rdd.collect();
           for (Tuple2<String, Long> r : ret) {
             if (result.containsKey(r._1())) {
@@ -121,13 +115,12 @@ public class JavaKafkaStreamSuite implements Serializable {
               result.put(r._1(), r._2());
             }
           }
-
-          return null;
         }
       }
     );
 
     ssc.start();
+
     long startTime = System.currentTimeMillis();
     boolean sizeMatches = false;
     while (!sizeMatches && System.currentTimeMillis() - startTime < 20000) {
@@ -135,9 +128,8 @@ public class JavaKafkaStreamSuite implements Serializable {
       Thread.sleep(200);
     }
     Assert.assertEquals(sent.size(), result.size());
-    for (String k : sent.keySet()) {
-      Assert.assertEquals(sent.get(k).intValue(), result.get(k).intValue());
+    for (Map.Entry<String, Integer> e : sent.entrySet()) {
+      Assert.assertEquals(e.getValue().intValue(), result.get(e.getKey()).intValue());
     }
-    ssc.stop();
   }
 }
